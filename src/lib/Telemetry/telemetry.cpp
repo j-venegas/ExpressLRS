@@ -98,12 +98,21 @@ bool Telemetry::GetNextPayload(uint8_t* nextPayloadSize, uint8_t **payloadData)
     do
     {
         currentPayloadIndex = (currentPayloadIndex + 1) % payloadTypesCount;
+
+        if (currentPayloadIndex == queueOffsetIndex) {
+            currentPayloadIndex = queueOffsetIndex + queueHeadIndex;
+        }
+
         checks++;
     } while(!payloadTypes[currentPayloadIndex].updated && checks < payloadTypesCount);
 
     if (payloadTypes[currentPayloadIndex].updated)
     {
         payloadTypes[currentPayloadIndex].locked = true;
+
+        if (currentPayloadIndex >= queueOffsetIndex) {
+            queueHeadIndex = (currentPayloadIndex - queueOffsetIndex + 1) % queueSize;
+        }
 
         realLength = CRSF_FRAME_SIZE(payloadTypes[currentPayloadIndex].data[CRSF_TELEMETRY_LENGTH_INDEX]);
         if (realLength > 0)
@@ -144,10 +153,11 @@ void Telemetry::ResetState()
     telemetry_state = TELEMETRY_IDLE;
     currentTelemetryByte = 0;
     currentPayloadIndex = 0;
-    twoslotLastQueueIndex = 0;
+    queueHeadIndex = 0;
+    queueTailIndex = queueSize - 1;
     receivedPackages = 0;
 
-    uint8_t offset = 0;
+    uint16_t  offset = 0;
 
     for (int8_t i = 0; i < payloadTypesCount; i++)
     {
@@ -296,19 +306,11 @@ bool Telemetry::AppendTelemetryPackage(uint8_t *package)
             // reserve last slot for adrupilot custom frame with the sub type status text: this is needed to make sure the important status messages are not lost
             if (package[CRSF_TELEMETRY_TYPE_INDEX + 1] == CRSF_AP_CUSTOM_TELEM_STATUS_TEXT)
             {
-                targetIndex = payloadTypesCount - 1;
+                // not sure what's the best way to handle this scenario
             }
-            else
-            {
-                targetIndex = payloadTypesCount - 2;
-            }
-            targetFound = true;
         }
         else if (extHeader->orig_addr == CRSF_ADDRESS_FLIGHT_CONTROLLER)
         {
-            targetIndex = payloadTypesCount - 2;
-            targetFound = true;
-
             #if defined(USE_MSP_WIFI) && defined(TARGET_RX)
                 // this probably needs refactoring in the future, I think we should have this telemetry class inside the crsf module
                 if (wifi2tcp.hasClient() && (header->type == CRSF_FRAMETYPE_MSP_RESP || header->type == CRSF_FRAMETYPE_MSP_REQ)) // if we have a client we probs wanna talk to it
@@ -325,34 +327,23 @@ bool Telemetry::AppendTelemetryPackage(uint8_t *package)
                     mspVtxProcessPacket(package);
                 }
 #endif
-                // This code is emulating a two slot FIFO with head dropping
-                if (currentPayloadIndex == payloadTypesCount - 2 && payloadTypes[currentPayloadIndex].locked)
-                {
-                    // Sending the first slot, use the second
-                    targetIndex = payloadTypesCount - 1;
-                }
-                else if (currentPayloadIndex == payloadTypesCount - 1 && payloadTypes[currentPayloadIndex].locked)
-                {
-                    // Sending the second slot, use the first
-                    targetIndex = payloadTypesCount - 2;
-                }
-                else if (twoslotLastQueueIndex == payloadTypesCount - 2 && payloadTypes[twoslotLastQueueIndex].updated)
-                {
-                    // Previous frame saved to the first slot, use the second
-                    targetIndex = payloadTypesCount - 1;
-                }
-                twoslotLastQueueIndex = targetIndex;
             }
         }
-        else
-        {
-            targetIndex = payloadTypesCount - 1;
-            targetFound = true;
-        }
+
+        uint8_t newTargetIndex = 0;
+        uint8_t checks = 0;
+
+        do {
+            queueTailIndex = (queueTailIndex + 1) % queueSize;
+            newTargetIndex = queueOffsetIndex + queueTailIndex;
+        } while (payloadTypes[newTargetIndex].locked && ++checks < queueSize);
+
+        targetIndex = newTargetIndex;
+        targetFound = true;
     }
     else
     {
-        for (int8_t i = 0; i < payloadTypesCount - 2; i++)
+        for (int8_t i = 0; i < queueOffsetIndex; i++)
         {
             if (header->type == payloadTypes[i].type)
             {
